@@ -9,8 +9,64 @@ on:
         description: "smfc release tag"
         required: true
 
+env:
+  RELEASE_TAG: ${{ github.event.client_payload.release_tag || inputs.release_tag }}
+
 jobs:
+  build-el:
+    name: Build RPM package (${{ matrix.dist }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - dist: el10
+            image: almalinux:10
+    container: ${{ matrix.image }}
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y 'dnf-command(config-manager)'
+          dnf config-manager --set-enabled crb
+          dnf install -y git rpm-build python3-devel python3-setuptools python3-pip python3-wheel pyproject-rpm-macros systemd-rpm-macros
+
+      - name: Checkout smfc at the release tag
+        uses: actions/checkout@v4
+        with:
+          repository: petersulyok/smfc
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Get version
+        run: echo "VERSION=$(grep '^Version:' smfc.spec | awk '{print $2}')" >> $GITHUB_ENV
+
+      - name: Adapt project metadata for the distribution's setuptools
+        # rewrite PEP 639 license metadata for setuptools 69
+        run: |
+          sed -i -e 's/^license = "\(.*\)"$/license = {text = "\1"}/' -e '/^license-files/d' pyproject.toml
+          grep -q 'license = {text' pyproject.toml
+
+      - name: Create source tarball
+        run: |
+          mkdir -p ~/rpmbuild/SOURCES
+          tar czf ~/rpmbuild/SOURCES/smfc-${VERSION}.tar.gz --transform="s,^./,smfc-${VERSION}/," --exclude='.git' --exclude='.venv' .
+
+      - name: Build RPM package
+        run: rpmbuild -bb smfc.spec
+
+      - name: Check the built package
+        run: |
+          rpm -qp --requires ~/rpmbuild/RPMS/noarch/smfc-*.rpm
+          dnf install -y ~/rpmbuild/RPMS/noarch/smfc-*.rpm
+          smfc -v
+
+      - name: Upload RPM package
+        uses: actions/upload-artifact@v4
+        with:
+          name: smfc-${{ env.VERSION }}-${{ matrix.dist }}
+          path: ~/rpmbuild/RPMS/noarch/smfc-*.rpm
+
   publish:
+    needs: [build-el]
     runs-on: ubuntu-latest
     container: fedora:latest
     permissions:
@@ -41,12 +97,18 @@ jobs:
         id: tag
         run: echo "value=${{ github.event.client_payload.release_tag || inputs.release_tag }}" >> $GITHUB_OUTPUT
 
-      - name: Download .rpm from release
+      - name: Download Fedora .rpm from release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p /tmp/in
           gh release download "${{ steps.tag.outputs.value }}" -R petersulyok/smfc -p '*.rpm' -D /tmp/in
+
+      - name: Download EL .rpm build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: smfc-*-el*
+          path: /tmp/el
 
       - name: Bootstrap gh-pages content
         run: |
@@ -56,14 +118,21 @@ jobs:
           if [ ! -f smfc.repo ]; then
             git show origin/main:smfc.repo > smfc.repo
           fi
-          mkdir -p packages
+          if [ ! -f smfc-el.repo ]; then
+            git show origin/main:smfc-el.repo > smfc-el.repo
+          fi
+          mkdir -p packages el10/packages
 
-      - name: Sign and add package to repository
+      - name: Sign and add packages to repositories
         run: |
           cp /tmp/in/*.rpm packages/
-          rpm --addsign packages/*.rpm
-          createrepo_c --update .
+          cp /tmp/el/smfc-*-el10/*.rpm el10/packages/
+          rpm --addsign packages/*.rpm el10/packages/*.rpm
+          ls packages/*.rpm > /tmp/root-pkglist
+          createrepo_c --update --pkglist /tmp/root-pkglist .
+          createrepo_c --update el10
           gpg --batch --yes --detach-sign --armor repodata/repomd.xml
+          gpg --batch --yes --detach-sign --armor el10/repodata/repomd.xml
 
       - name: Commit and push gh-pages
         run: |
